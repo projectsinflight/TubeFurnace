@@ -1,2 +1,0 @@
-# RampSoakPID Library for Arduino
-
