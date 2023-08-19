@@ -3,6 +3,7 @@
 #include <math.h>
 #include <LiquidCrystal_I2C.h> // Library for LCD
 #include <RunningAverage.h>
+#include <RampSoakPID.h>
 
 /*************************** DEFINES *******************************/
 
@@ -24,7 +25,7 @@
 // registers
 #define ICR1_VAL 15624  // Set the PWM frequency to 4Hz: 16MHz/(256 * 4Hz) - 1 = 15624
 
-// system
+// system mode
 #define STOP_MODE      0     // mode where the heater is off completely
 #define MANUAL_MODE    1     // system mode for controlling pwm manually
 #define AUTO_MODE      2     // system mode for holding upward ramp rate steady
@@ -35,18 +36,16 @@
 #define MINPWM 0        // min allowable PWM percentage for tube 
 #define MAXTEMP 1200    // max allowable temperature for tube furnace
 #define MINTEMP 0       // min allowable temperature for tube furnace
-#define RAMP_LIMIT_POS 20   // maximum allowable ramp rate for heating (deg C per min)
-#define RAMP_LIMIT_NEG -20  // maximum allowable ramp rate for heating (deg C per min)
 
 // time periods
 #define TEMP_PERIOD 100 // interval to measure temp value
 #define LCD_PERIOD 100 // interval to update LCD
-#define PID_PERIOD 100 // pid loop update interval in milliseconds
+#define PID_PERIOD 100 // interval of time to update PID loop
 #define LOG_PERIOD 100 // log interval in milliseconds
 
 // other
 #define BUFSIZE 64
-#define N_RAMP_AVG 30   // number of values to average to smooth ramp values
+#define N_RAMP_AVG 10   // number of values to average to smooth ramp values
 #define N_TEMP_AVG 10
 #define DEGREE_SYMBOL ((char)223)
 #define DEGREES_PER_COUNT 10
@@ -62,7 +61,7 @@ void initEncoder();
 void initTime();
 void initThermocouple();
 void initPwm();
-void resetPid();
+void initPID();
 void initLog();
 void measureTemp();
 void displayData();
@@ -75,7 +74,6 @@ void logData();
 float mapPidToPwm(float pid);
 void calculateRampRate();
 void updatePwm();
-void pidStep(float currentVal, float setPoint);
 void isrCLK();
 
 /*************************** GLOBALS *******************************/
@@ -95,30 +93,11 @@ unsigned long nextLogTime = 0;   // keeps track of when to log data
 
 // temperature values
 float desiredTemp = 0.0; // temperature we want the furnace to reach
-float nextTemp = 0.0;    // the next temp the PID loop is shooting for (for ramp control)
 float currentTemp = 0.0; // whatever the current temperature is
 float prevTemp = 0.0;    // previous temperature value
-float rampRate = 0.0;    // difference between current and previous temp
+float rampRateF = 0.0;    // difference between current and previous temp
 bool rampInitialized = false; // whether or not we've calculated the ramp yet (prevent prevTemp == 0 problem)
 float rampLimit = 0;
-
-// pid variables
-float pidCoefficientTable[NUM_MODES][4] = {   // {P, I, D, WINDUP_LIMIT}
-  { 0.0,  0.0,   0.0,  0.0},  /* STOP MODE   */
-  { 0.0,  0.0,   0.0,  0.0},  /* MANUAL MODE */
-  { 1.0,  0.5,   0.3, 100.0}, /* AUTO MODE   */
-};
-float Kp = 0.0;     // 
-float Ki = 0.0;     // 
-float Kd = 0.0;     // 
-float error = 0.0;
-float PVal = 0.0;
-float IVal = 0.0;
-float DVal = 0.0;
-float windup = 0.0; // integrator windup limit
-float pidVal = 0.0; // output of PID loop
-float previousError = 0.0; // last PID error value (used to compute D term)
-bool previousErrorInitialized = false; // whether or not we've computed the D term yet (to stop the prevError == 0 problem)
 
 // lcd
 LiquidCrystal_I2C lcd(0x27, 16, 2); // I2C address 0x27, 16 column and 2 rows
@@ -155,8 +134,7 @@ void setup() {
   initTime();
   initThermocouple();
   initPwm();
-  pidUpdateTime = currentTime;
-  resetPid();
+  initPID();
   initLog();
 
   // init LEDS
@@ -184,7 +162,7 @@ void loop() {
   recvSerial();
   evaluateCommand();
   updateHeater();
-  logData();
+  // logData();
 
 }
 
@@ -241,18 +219,14 @@ void initPwm() {
   OCR1A = 0;                                        // Set PWM output to 0 for now
 }
 
-// init pid loop
-void resetPid()
-{
-  // initialize the coeficcients Kp, Ki, and Kd
-  Kp = pidCoefficientTable[systemMode][0];
-  Ki = pidCoefficientTable[systemMode][1];
-  Kd = pidCoefficientTable[systemMode][2];
-  windup = pidCoefficientTable[systemMode][3];
-  // reset last pid value
-  pidVal = 0;
-  previousError = 0;
-  previousErrorInitialized = false;
+// init pid
+void initPID() {
+  pidUpdateTime = currentTime;
+  setPidCoefficients(0.5, 0.05, 1.0);
+  setIntegratorWindupLimit(100);
+  setRampLimit(-30, 30);
+  setCrossoverDistance(10);
+  setDebugOnOff(true);
 }
 
 // init logging
@@ -260,7 +234,6 @@ void initLog() {
   // update log timers
   nextLogTime = currentTime;
 }
-
 
 // measure the temperature and update running avg
 void measureTemp() {
@@ -280,28 +253,8 @@ void measureTemp() {
   }
 
   // now add ramp rate to averager
-  rampRate = 60 * (1000.0/TEMP_PERIOD) * (currentTemp - prevTemp);
-  rampAvg.addValue(rampRate);
-
-  // if we are ramping up, update the next temp value by a small increment
-  // if we are holding, dont update the next temp value
-  // if we are ramping down, subtract a small amount
-  if (currentTemp < (desiredTemp - 5)) {
-    // ramping up
-    nextTemp += RAMP_LIMIT_POS * TEMP_PERIOD / (1000.0 * 60);
-    if (nextTemp > currentTemp + 5) {
-      nextTemp = currentTemp + 5;
-    }    
-  } else if (currentTemp > (desiredTemp + 5)) {
-    // ramping down
-    nextTemp -= RAMP_LIMIT_POS * TEMP_PERIOD / (1000.0 * 60);   
-    if (nextTemp < currentTemp - 5) {
-      nextTemp = currentTemp - 5;
-    }    
-  } else {
-    // holding steady
-    nextTemp = desiredTemp;
-  }
+  rampRateF = 60 * (1000.0/TEMP_PERIOD) * (currentTemp - prevTemp);
+  rampAvg.addValue(rampRateF);
     
 }
 
@@ -397,7 +350,6 @@ void updateButton() {
 		//button has been pressed, released and pressed again
 		if (millis() - lastButtonPress > 100) {
       desiredTemp = (counter * DEGREES_PER_COUNT) + DEGREES_START;
-      nextTemp = currentTemp;
       systemMode = AUTO_MODE;
 		}
 
@@ -467,7 +419,7 @@ void evaluateCommand() {
     newTemp = atoi(strbuf + 1);
     if ((newTemp <= MAXTEMP) && (newTemp >= MINTEMP)) {
       desiredTemp = newTemp;
-      nextTemp = currentTemp;
+      setTargetValue(desiredTemp);
       systemMode = AUTO_MODE;
       resetPid();
       Serial.print("Set temp to ");
@@ -482,26 +434,26 @@ void evaluateCommand() {
   // set PID values
   } else if (strbuf[0] == 'P') {
     val = atof(strbuf + 1);
-    pidCoefficientTable[systemMode][0] = val;
-    resetPid();
+    setKp(val);
+    // resetPid();
     Serial.print("Set P value to ");
     Serial.println(val);
   } else if (strbuf[0] == 'I') {
     val = atof(strbuf + 1);
-    pidCoefficientTable[systemMode][1] = val;
-    resetPid();
+    setKi(val);
+    // resetPid();
     Serial.print("Set I value to ");
     Serial.println(val);
   } else if (strbuf[0] == 'D') {
     val = atof(strbuf + 1);
-    pidCoefficientTable[systemMode][2] = val;
-    resetPid();
+    setKd(val);
+    // resetPid();
     Serial.print("Set D value to ");
     Serial.println(val);
   } else if (strbuf[0] == 'W') {
     val = atof(strbuf + 1);
-    pidCoefficientTable[systemMode][3] = val;
-    resetPid();
+    setIntegratorWindupLimit(val);
+    // resetPid();
     Serial.print("Set W value to ");
     Serial.println(val);
 
@@ -532,7 +484,7 @@ void updateHeater() {
         // keep constant PWM, dont run PID
         break;
       case AUTO_MODE :
-        pidStep(currentTemp, nextTemp);
+        float pidVal = pidStep(currentTemp);
         updatePwm(mapPidToPwm(pidVal));
         break;
     }
@@ -545,26 +497,14 @@ void logData() {
   if (nextLogTime < currentTime) {
     nextLogTime += LOG_PERIOD;
     // print logs
-  // Serial.print("temp:"); Serial.print(currentTemp); Serial.print(",");
-  Serial.print("tempAvg:"); Serial.print(tempAvg.getAverage()); Serial.print(",");
-  // Serial.print("ramp:"); Serial.print(rampRate); Serial.print(",");
-  Serial.print("rampAvg:"); Serial.print(rampAvg.getAverage()); Serial.print(",");
+    Serial.print("temp:"); Serial.print(currentTemp); Serial.print(",");
+    Serial.print("tempAvg:"); Serial.print(tempAvg.getAverage()); Serial.print(",");
+    Serial.print("ramp:"); Serial.print(rampRateF); Serial.print(",");
+    Serial.print("rampAvg:"); Serial.print(rampAvg.getAverage()); Serial.print(",");
     Serial.print("pwmPercent:");  Serial.print(pwmPercent);    Serial.print(",");
-  // Serial.print("d:"); Serial.print(DVal); Serial.print(",");
-  // Serial.print("dValAvg:"); Serial.print(dValAvg.avg()); Serial.print(",");
-
-  Serial.print("error:");       Serial.print(error);         Serial.print(",");
-  Serial.print("PVal:");        Serial.print(PVal);          Serial.print(",");
-  Serial.print("IVal:");        Serial.print(IVal);          Serial.print(",");
-  Serial.print("DVal:");        Serial.print(DVal);          Serial.print(",");
-  Serial.print("nextTemp:");     Serial.print(nextTemp);     Serial.print(",");
-  Serial.print("pidVal:");      Serial.print(pidVal);        Serial.print(",");
-  Serial.print("pwmPercent:");  Serial.print(pwmPercent);    Serial.print(",");
-  Serial.print("currentTemp:");  Serial.print(currentTemp);  Serial.print(",");
-  Serial.print("desiredTemp:"); Serial.print(desiredTemp);   Serial.print(",");
-  Serial.print("Kp:");          Serial.print(Kp);            Serial.print(",");
-  Serial.print("Ki:");          Serial.print(Ki);            Serial.print(",");
-  Serial.print("Kd:");          Serial.print(Kd);            Serial.println("");
+    Serial.print("pwmPercent:");  Serial.print(pwmPercent);    Serial.print(",");
+    Serial.print("currentTemp:");  Serial.print(currentTemp);  Serial.print(",");
+    Serial.print("desiredTemp:"); Serial.print(desiredTemp);   Serial.print(",");
   }
 }
 
@@ -592,22 +532,4 @@ float mapPidToPwm(float pid) {
   return val;
 }
 
-// we want to make the PID loop agnostic to systemMode, so we will achieve this
-// by passing in the time 
-void pidStep(float currentVal, float setPoint)
-{
-  float dt = PID_PERIOD/1000.0; // convert from ms to s
 
-  error = setPoint - currentVal;
-  PVal = Kp * error;
-  IVal += Ki * error * dt;
-  DVal = Kd * -1 * rampAvg.getAverage();
-  // integrator windup prevention
-  if (IVal > windup) {
-      IVal = windup;
-  } else if (IVal < (-1 * windup)) {
-      IVal = -1 * windup;
-  }
-  pidVal = PVal + IVal + DVal;
-
-}
