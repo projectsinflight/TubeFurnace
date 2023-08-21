@@ -1,3 +1,5 @@
+#include <RampSoakPID.h>
+
 /*************************** INCLUDES ******************************/
 #include "TubeFurnace.h"
 
@@ -21,6 +23,7 @@ void loop() {
   getTime();
   measureTemp();
   displayData();
+  updateLEDs();
   updateButton();
   recvSerial();
   evaluateCommand();

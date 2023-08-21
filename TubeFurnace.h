@@ -62,6 +62,7 @@ void initLog();
 void getTime();
 void measureTemp();
 void displayData();
+void updateLEDs();
 void updateEncoder();
 void updateButton();
 void recvSerial();

@@ -227,6 +227,15 @@ void displayData() {
   lcd.print(row2);
 }
 
+// updates status LEDs
+void updateLEDs() {
+  if ((desiredTemp > 100) || (currentTemp > 100)) {
+    digitalWrite(YELLOW_LED, HIGH);
+  } else {
+    digitalWrite(YELLOW_LED, LOW);
+  }
+}
+
 // keep track of position of rotary encoder
 void updateEncoder() {
 
