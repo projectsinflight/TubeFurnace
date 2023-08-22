@@ -51,6 +51,7 @@
 void setup();
 void loop();
 void initSerial();
+void resetClock();
 void initLcd();
 void initLED();
 void initEncoder();

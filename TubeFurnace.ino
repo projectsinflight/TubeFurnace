@@ -7,6 +7,7 @@
 void setup() {
 
   initSerial();
+  resetClock();
   initLcd();
   initLED();
   initEncoder();

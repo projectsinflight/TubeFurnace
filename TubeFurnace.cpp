@@ -21,6 +21,7 @@ unsigned long nextTempTime = 0;  // keeps track of when to measure temp val
 unsigned long lcdUpdateTime = 0; // when to update the LCD
 unsigned long pidUpdateTime = 0; // keeps track of when to update PID
 unsigned long nextLogTime = 0;   // keeps track of when to log data
+unsigned long clockStart = 0;    // 
 
 // temperature values
 float desiredTemp = 0.0; // temperature we want the furnace to reach
@@ -56,6 +57,11 @@ void initSerial() {
   // initialize serial
   Serial.begin(115200);
   while (!Serial) delay(10);
+}
+
+// init clock
+void resetClock() {
+  clockStart = millis();
 }
 
 // init lcd
@@ -185,7 +191,7 @@ void displayData() {
     t = (counter * DEGREES_PER_COUNT) + DEGREES_START;
   }
   int r = (int)rampAvg.getAverage();
-  int total_sec = currentTime / 1000;
+  int total_sec = (currentTime - clockStart) / 1000;
   int m = total_sec / 60;
   int s = total_sec % 60;
 
@@ -246,11 +252,24 @@ void updateEncoder() {
 
   if (digitalRead(CLK) == HIGH) {
     if (digitalRead(DT) == LOW) {
-      counter ++;
+      counter++;
       currentDir ="CW";
+      desiredTemp = (counter * DEGREES_PER_COUNT) + DEGREES_START;
+      if (desiredTemp > 1200) {
+        counter--;
+        desiredTemp = 1200;
+      }
     } else {
       counter --;
       currentDir ="CCW";
+      desiredTemp = (counter * DEGREES_PER_COUNT) + DEGREES_START;
+      if (desiredTemp < 10) {
+        counter++;
+        desiredTemp = 10;
+      }
+    }
+    if (systemMode == AUTO_MODE) {
+      setTargetValue(desiredTemp);
     }
   }
 }
@@ -264,8 +283,13 @@ void updateButton() {
 		//if 100ms have passed since last LOW pulse, it means that the
 		//button has been pressed, released and pressed again
 		if (millis() - lastButtonPress > 100) {
-      desiredTemp = (counter * DEGREES_PER_COUNT) + DEGREES_START;
-      systemMode = AUTO_MODE;
+      // desiredTemp = (counter * DEGREES_PER_COUNT) + DEGREES_START;
+      // systemMode = AUTO_MODE;
+      resetClock();
+      if (systemMode == STOP_MODE) {
+        setTargetValue(desiredTemp);
+        systemMode = AUTO_MODE;
+      }
 		}
 
 		// Remember last button press event
@@ -376,6 +400,11 @@ void evaluateCommand() {
   } else if (strbuf[0] == 'E') {
     Serial.println("EMERGENCY STOP");  // probably need to make this more foolproof like a hard shutdown
     systemMode = STOP_MODE;
+
+  // Reset Clock
+  } else if (strbuf[0] == 'C') {
+    Serial.println("Reset Clock");  // 
+    resetClock();
 
   // command not recognized
   } else {
